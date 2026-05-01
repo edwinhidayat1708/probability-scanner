@@ -13,7 +13,7 @@ HOLD_DAYS = 3
 TARGET_RETURN = 0.08
 MIN_DATA = 120
 
-# DAFTAR 250+ EMITEN PAPAN UTAMA
+# DAFTAR EMITEN PAPAN UTAMA
 TICKERS_IDX = [
     'AALI.JK', 'ABMM.JK', 'ACES.JK', 'ADHI.JK', 'ADMF.JK', 'ADMR.JK', 'ADRO.JK', 'AGRO.JK', 'AGRS.JK', 'AHAP.JK',
     'AKRA.JK', 'ALDO.JK', 'ALKA.JK', 'AMAR.JK', 'AMRT.JK', 'ANDI.JK', 'ANJT.JK', 'ANTM.JK', 'APIC.JK', 'APLI.JK',
@@ -68,16 +68,13 @@ def create_features(df):
     df['ma20'] = df['Close'].rolling(20).mean()
     df['ma50'] = df['Close'].rolling(50).mean()
     df['trend'] = df['Close'] / (df['ma50'] + 1e-9)
-    df['ma_gap'] = (df['ma20'] - df['ma50']) / (df['ma50'] + 1e-9)
-    df['momentum_slope'] = df['Close'].rolling(5).mean().pct_change(5)
+    df['ma_ratio'] = df['Close'] / (df['ma20'] + 1e-9)
     df['vol_ma'] = df['Volume'].rolling(10).mean()
     df['vol_ratio'] = df['Volume'] / (df['vol_ma'] + 1e-9)
     df['volatility'] = df['Close'].pct_change().rolling(10).std()
     df['range'] = (df['High'] - df['Low']) / (df['Close'] + 1e-9)
     df['hh_10'] = df['High'].rolling(10).max()
     df['breakout'] = df['Close'] / (df['hh_10'] + 1e-9)
-    
-    # FITUR YANG KEMBALI DIMASUKKAN
     df['breakout_strength'] = df['Close'] - df['hh_10'].shift(1)
     
     delta = df['Close'].diff()
@@ -93,7 +90,18 @@ def create_label(df):
     df['target'] = (future_close / df['Close'] - 1) >= TARGET_RETURN
     return df
 
-# DOWNLOAD PROCESS
+# =========================
+# DOWNLOAD IHSG CONTEXT
+# =========================
+print("Downloading IHSG context...")
+ihsg_data = yf.download('^JKSE', period="1y", interval="1d", progress=False)
+ihsg_data['ihsg_ret_3'] = ihsg_data['Close'].pct_change(3)
+ihsg_data['ihsg_trend'] = ihsg_data['Close'] / ihsg_data['Close'].rolling(50).mean()
+ihsg_context = ihsg_data[['ihsg_ret_3', 'ihsg_trend']].ffill()
+
+# =========================
+# DOWNLOAD ALL TICKERS
+# =========================
 print(f"Downloading data for {len(TICKERS_IDX)} tickers...")
 raw_data = yf.download(TICKERS_IDX, period="1y", interval="1d", group_by='ticker', progress=False, threads=True)
 
@@ -108,6 +116,10 @@ for ticker in TICKERS_IDX:
         df['ticker'] = ticker.replace('.JK', '')
         df = create_features(df)
         df = create_label(df)
+        
+        # GABUNGKAN DATA SAHAM DENGAN KONTEKS IHSG (Berdasarkan Tanggal)
+        df = df.merge(ihsg_context, left_on='Date', right_index=True, how='left')
+        
         all_data.append(df)
     except:
         continue
@@ -116,40 +128,58 @@ if not all_data:
     send_telegram("❌ Error: Gagal mendownload data.")
     exit(0)
 
-df_all = pd.concat(all_data, ignore_index=True).dropna(subset=['rsi', 'target', 'breakout_strength'])
+df_all = pd.concat(all_data, ignore_index=True).dropna(subset=['rsi', 'target', 'ihsg_trend'])
 
-# MACHINE LEARNING
-features = ['ret_1','ret_3','trend','ma_gap','momentum_slope','vol_ratio','volatility','range','breakout', 'breakout_strength', 'rsi']
+# =========================
+# MACHINE LEARNING + IHSG
+# =========================
+features = [
+    'ret_1','ret_3','trend','ma_ratio','vol_ratio','volatility','range',
+    'breakout', 'breakout_strength', 'rsi',
+    'ihsg_ret_3', 'ihsg_trend' # FITUR BARU
+]
+
 df_all = df_all.sort_values('Date')
 split_date = df_all['Date'].quantile(0.7)
 train_df = df_all[df_all['Date'] <= split_date]
-test_df  = df_all[df_all['Date'] > split_date]
 
 X_train = train_df[features]
 y_train = train_df['target'].astype(int)
 
 scale_pos_weight = (len(y_train) - y_train.sum()) / (y_train.sum() + 1e-9)
-model = XGBClassifier(n_estimators=300, max_depth=4, learning_rate=0.05, scale_pos_weight=scale_pos_weight, random_state=42, eval_metric='logloss')
+model = XGBClassifier(
+    n_estimators=300, 
+    max_depth=4, 
+    learning_rate=0.05, 
+    scale_pos_weight=scale_pos_weight, 
+    random_state=42, 
+    eval_metric='logloss'
+)
 model.fit(X_train, y_train)
 
+# =========================
 # LIVE SCANNING
+# =========================
 latest_date = df_all['Date'].max()
 df_live = df_all[df_all['Date'] == latest_date].copy()
 df_live['prob'] = model.predict_proba(df_live[features])[:,1]
 
+# FILTER KETAT
 df_final = df_live[
     (df_live['prob'] > 0.70) & 
     (df_live['trend'] > 1.0) & 
-    (df_live['vol_ratio'] > 1.2)
+    (df_live['vol_ratio'] > 1.1) &
+    (df_live['rsi'].between(50, 80))
 ].copy()
 
 if not df_final.empty:
     df_final['score'] = (df_final['prob'] * 0.7 + df_final['vol_ratio'] * 0.3)
     df_final = df_final.sort_values(by='score', ascending=False).head(10)
     
-    msg = f"🚀 *IDX MAIN BOARD HITS*\n📅 {latest_date.strftime('%Y-%m-%d')}\n\n"
+    msg = f"🚀 *IDX PROBABILITY HITS (MARKET CONTEXT)*\n📅 {latest_date.strftime('%Y-%m-%d')}\n"
+    msg += f"📊 IHSG Trend: {'Bullish' if ihsg_context.iloc[-1]['ihsg_trend'] > 1 else 'Bearish'}\n\n"
     for _, row in df_final.iterrows():
-        msg += f"• *{row['ticker']}*\n  Prob: {row['prob']:.2f} | Strength: {row['breakout_strength']:.1f}\n  Vol Ratio: {row['vol_ratio']:.1f} | RSI: {row['rsi']:.1f}\n\n"
+        msg += f"• *{row['ticker']}*\n  Prob: {row['prob']:.2f} | RSI: {row['rsi']:.1f}\n  Vol Ratio: {row['vol_ratio']:.1f}\n\n"
     send_telegram(msg)
 else:
-    send_telegram(f"✅ *Screener Selesai*\n{latest_date.strftime('%Y-%m-%d')}\nTidak ada sinyal.")
+    send_telegram(f"✅ *Screener Selesai*\n{latest_date.strftime('%Y-%m-%d')}\nKondisi market/saham belum memenuhi kriteria.")
